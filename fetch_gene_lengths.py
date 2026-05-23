@@ -4,9 +4,10 @@ from io import StringIO
 import pandas as pd
 import requests
 
-# Ensembl 113 (Oct 2024) — pin release so lengths/mappings are reproducible
-ENSEMBL_RELEASE = "113"
-BIOMART_URL = "https://oct2024.archive.ensembl.org/biomart/martservice"
+from utils import HGNC_COMPLETE_SET_URL, build_ensembl_to_symbols
+
+ENSEMBL_RELEASE = "current"
+BIOMART_URL = "https://www.ensembl.org/biomart/martservice"
 OUT_PATH = "data/genes/gene_lengths.csv"
 
 BIOMART_XML = """<?xml version="1.0" encoding="UTF-8"?>
@@ -29,25 +30,32 @@ def fetch_gene_lengths() -> pd.DataFrame:
     effective-length proxy for TPM normalization.
 
     Returns:
-        DataFrame indexed by ensembl_gene_id with columns:
+        DataFrame indexed by ensembl_id with columns:
         hgnc_symbol, gene_biotype, transcript_length_bp (median, float).
     """
     r = requests.get(BIOMART_URL, params={"query": BIOMART_XML}, timeout=300)
     r.raise_for_status()
 
     df = pd.read_csv(StringIO(r.text), sep="\t")
-    df.columns = ["ensembl_gene_id", "hgnc_symbol", "gene_biotype", "transcript_length"]
+    df.columns = ["ensembl_id", "hgnc_symbol", "gene_biotype", "transcript_length"]
 
     df["transcript_length"] = pd.to_numeric(df["transcript_length"], errors="coerce")
-    df = df.dropna(subset=["ensembl_gene_id", "transcript_length"])
-    df = df[df["ensembl_gene_id"].str.strip() != ""]
+    df = df.dropna(subset=["ensembl_id", "transcript_length"])
+    df = df[df["ensembl_id"].str.strip() != ""]
     df = df[df["gene_biotype"] == "protein_coding"]
 
-    return df.groupby("ensembl_gene_id").agg(
-        hgnc_symbol=("hgnc_symbol", lambda x: x.dropna().iloc[0] if len(x.dropna()) else ""),
+    lengths = df.groupby("ensembl_id").agg(
         gene_biotype=("gene_biotype", "first"),
         transcript_length_bp=("transcript_length", "median"),
     )
+
+    # Enrich hgnc_symbol from HGNC complete set (more reliable than BioMart's annotation)
+    hgnc = pd.read_csv(HGNC_COMPLETE_SET_URL, sep="\t", low_memory=False)
+    ensembl_to_syms = build_ensembl_to_symbols(hgnc)
+    lengths["hgnc_symbol"] = lengths.index.map(
+        lambda eid: ensembl_to_syms.get(eid, [""])[0]
+    )
+    return lengths[["hgnc_symbol", "gene_biotype", "transcript_length_bp"]]
 
 
 if __name__ == "__main__":

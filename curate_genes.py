@@ -1,11 +1,13 @@
 import re
-import h5py
 import numpy as np
 import pandas as pd
 import archs4py as a4
 from tqdm import tqdm
 
+from utils import build_ensembl_to_symbols, build_symbol_to_ensembl_hgnc, load_samples, qc_samples
+
 ARCHS4_PATH = "data/archs4/human_gene_v2.latest.h5"
+GENE_LENGTHS_CSV = "data/genes/gene_lengths.csv"
 
 MUST_HAVE = {
     "TNF", "IL6", "IL1B", "IFNG",
@@ -153,10 +155,6 @@ gene_group_quota = {
     "housekeeping": 16,
 }
 
-HGNC_COMPLETE_SET_URL = (
-    "https://storage.googleapis.com/public-download-files/hgnc/tsv/tsv/hgnc_complete_set.txt"
-)
-
 MSIGDB_RELEASE_BASE = "https://data.broadinstitute.org/gsea-msigdb/msigdb/release"
 
 MSIGDB_PATTERNS = {
@@ -190,8 +188,6 @@ EXCLUDE_PREFIXES = ("MT-",)
 
 
 # QC thresholds
-MIN_ALIGNED_READS = 1_000_000
-MAX_SC_PROBABILITY = 0.5
 MIN_LOG_EXPRESSION_THRESHOLD = 1.0
 MIN_GENES_EXPRESSED = 200
 
@@ -280,49 +276,6 @@ def msigdb_group_match(collection: str, set_name_pattern: str, version: str) -> 
         if regex.search(parts[0]):
             genes.update(parts[2:])
     return genes
-
-
-def load_samples(archs4_path: str) -> pd.DataFrame:
-    """Load sample-level metadata from an ARCHS4 HDF5 file.
-
-    Args:
-        archs4_path: Path to the ARCHS4 .h5 file.
-
-    Returns:
-        DataFrame with columns: geo_accession, library_strategy,
-        alignedreads, singlecellprobability.
-    """
-    with h5py.File(archs4_path, "r") as f:
-        return pd.DataFrame({
-            "geo_accession": f["meta/samples/geo_accession"][:].astype(str),
-            "library_strategy": f["meta/samples/library_strategy"][:].astype(str),
-            "alignedreads": f["meta/samples/alignedreads"][:],
-            "singlecellprobability": f["meta/samples/singlecellprobability"][:],
-        })
-
-
-def qc_samples(meta: pd.DataFrame) -> pd.DataFrame:
-    """Filter samples to bulk RNA-seq with sufficient depth and low single-cell probability.
-
-    Args:
-        meta: Sample metadata DataFrame from load_samples().
-
-    Returns:
-        Filtered DataFrame with reset index.
-    """
-    n = len(meta)
-    meta = meta[meta["library_strategy"] == "RNA-Seq"]
-    print(f"RNA-Seq filter: {len(meta)}/{n}")
-
-    n = len(meta)
-    meta = meta[meta["singlecellprobability"] < MAX_SC_PROBABILITY]
-    print(f"SC filter (prob<{MAX_SC_PROBABILITY}): {len(meta)}/{n}")
-
-    n = len(meta)
-    meta = meta[meta["alignedreads"] >= MIN_ALIGNED_READS]
-    print(f"Aligned reads filter (>={MIN_ALIGNED_READS:,}): {len(meta)}/{n}")
-
-    return meta.reset_index(drop=True)
 
 
 def log_transform_and_filter_samples(expr: pd.DataFrame) -> np.ndarray:
@@ -429,6 +382,7 @@ if __name__ == "__main__":
     print("Aggregating duplicate genes...")
     expr = a4.utils.aggregate_duplicate_genes(expr)
 
+    from utils import HGNC_COMPLETE_SET_URL
     hgnc_complete_set = pd.read_csv(HGNC_COMPLETE_SET_URL, sep="\t", low_memory=False)
     protein_coding = set(
         hgnc_complete_set.loc[
@@ -437,32 +391,29 @@ if __name__ == "__main__":
     )
     print(f"Protein-coding genes in HGNC: {len(protein_coding)}")
 
-    # symbol → ensembl_id (one-to-one for most genes)
-    symbol_to_ensembl: dict[str, str] = (
-        hgnc_complete_set[["symbol", "ensembl_gene_id"]]
-        .dropna()
-        .set_index("symbol")["ensembl_gene_id"]
-        .to_dict()
-    )
-    # ensembl_id → all symbols (one-to-many for duplicate/retired entries)
-    ensembl_to_symbols: dict[str, list[str]] = (
-        hgnc_complete_set[["symbol", "ensembl_gene_id"]]
-        .dropna()
-        .groupby("ensembl_gene_id")["symbol"]
-        .apply(list)
-        .to_dict()
-    )
+    # symbol → ensembl_id: covers current symbol, prev_symbol, and alias_symbol
+    symbol_to_ensembl: dict[str, str] = build_symbol_to_ensembl_hgnc()
+    # ensembl_id → all current symbols (one-to-many)
+    ensembl_to_symbols: dict[str, list[str]] = build_ensembl_to_symbols(hgnc_complete_set)
+
+    gene_lengths = pd.read_csv(GENE_LENGTHS_CSV, index_col="ensembl_id")
+    valid_ensembl_ids = set(gene_lengths.index)
+
+    def _ensembl_id(gene: str) -> str:
+        return gene if gene.startswith("ENSG") else symbol_to_ensembl.get(gene, "")
 
     raw_stats = compute_gene_stats(expr.index.to_numpy(), expr)
     n_before = len(raw_stats)
+    has_length = raw_stats["gene"].map(_ensembl_id).isin(valid_ensembl_ids)
     sorted_gene_stats = filter_and_rank_genes(
         raw_stats[
             raw_stats["gene"].isin(protein_coding) &
             ~raw_stats["gene"].isin(EXCLUDE_GENES) &
-            ~raw_stats["gene"].str.startswith(EXCLUDE_PREFIXES)
+            ~raw_stats["gene"].str.startswith(EXCLUDE_PREFIXES) &
+            has_length
         ]
     )
-    print(f"Protein-coding + exclusion filter: removed {n_before - len(sorted_gene_stats)} genes ({len(sorted_gene_stats)} remain)")
+    print(f"Protein-coding + exclusion + length filter: removed {n_before - len(sorted_gene_stats)} genes ({len(sorted_gene_stats)} remain)")
 
     group_genes: dict[str, set[str]] = {}
     for group, patterns in tqdm(HGNC_GROUP_PATTERNS.items(), desc="Fetching HGNC groups"):
