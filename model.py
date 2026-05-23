@@ -18,6 +18,7 @@ class GPTConfig:
     dropout: float = 0.0
     # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     bias: bool = True
+    causal: bool = True
 
 
 class MLP(nn.Module):
@@ -44,7 +45,7 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        self.attn = SelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -54,7 +55,7 @@ class Block(nn.Module):
         return x
 
 
-class CausalSelfAttention(nn.Module):
+class SelfAttention(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
         assert config.n_embd % config.n_head == 0
@@ -66,44 +67,36 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
+        self.causal = config.causal
 
-        self.flash = hasattr(torch.nn.functional,
-                             'scaled_dot_product_attention')
-        if not self.flash:
-            print(
-                "WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash and self.causal:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                  .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
-        B, T, C = x.size()  # (batch_size, channels(embedding_dim), sequence_length(time steps))
+        B, T, C = x.size()
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
 
-        # (batch_size, n_heads, T, head_size)
         q = q.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
-        # (batch_size, n_heads, T, head_size)
         k = k.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
-        # (batch_size, n_heads, T, head_size)
         v = v.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
 
-        # use flash attention if available
-        if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
+        if self.flash:
             y = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, is_causal=True)
+                q, k, v, is_causal=self.causal)
         else:
-            # fallback to standard attention
-            att = (q @ k.transpose(-2, -1)) * \
-                (1 / math.sqrt(q.shape[-1]))  # (B, n_heads, T, T)
-            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))  # mask out future tokens
-            att = torch.softmax(att, dim=-1)  # (B, n_heads, T, T)
-            att = self.attn_dropout(att)  # (B, n_heads, T, T)
-            # (B, n_heads, T, T) X (B, n_heads, T, head_size) -> (B, n_heads, T, head_size)
+            att = (q @ k.transpose(-2, -1)) * (1 / math.sqrt(q.shape[-1]))
+            if self.causal:
+                att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+            att = torch.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
             y = att @ v
-        # (B, n_heads, T, head_size) -> (B, T, C)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.c_proj(y)  # (B, T, C) -> (B, T, C)
-        y = self.resid_dropout(y)  # (B, T, C)
+        y = self.c_proj(y)
+        y = self.resid_dropout(y)
         return y
 
 class GPT(nn.Module):
@@ -122,7 +115,7 @@ class GPT(nn.Module):
         self.config = config
         self.embedding_table = nn.Embedding(config.vocab_size, config.n_embd)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
-        self.causal_self_attention = CausalSelfAttention(config)
+        self.causal_self_attention = SelfAttention(config)
         self.device = device
 
     def forward(self, idx, targets=None):
@@ -247,3 +240,81 @@ class GPT(nn.Module):
         if non_embedding:
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
+
+
+@dataclass
+class NanoBulkFMConfig:
+    n_genes: int
+    n_layer: int
+    n_head: int
+    n_embd: int
+    dropout: float
+    bias: bool
+
+    def __post_init__(self):
+        self.block_size = self.n_genes
+        self.causal = False
+
+
+class NanoBulkFM(nn.Module):
+    def __init__(self, config: NanoBulkFMConfig, device="cpu"):
+        super().__init__()
+        self.config = config
+        self.device = device
+
+        self.expression_encoder = nn.Sequential(
+            nn.Linear(2, config.n_embd),
+            nn.GELU(),
+            nn.Linear(config.n_embd, config.n_embd),
+        )
+
+        self.gene_embedding = nn.Embedding(config.n_genes, config.n_embd)
+
+        self.drop = nn.Dropout(config.dropout)
+        self.h = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        self.ln_f = nn.LayerNorm(config.n_embd)
+
+        self.expression_decoder = nn.Sequential(
+            nn.Linear(config.n_embd, config.n_embd),
+            nn.GELU(),
+            nn.Linear(config.n_embd, 1),
+        )
+
+    def forward(self, x, mask=None, targets=None):
+        # x: [B, G]
+        B, G = x.shape
+        assert G == self.config.n_genes, f"Expected {self.config.n_genes} genes, got {G}"
+
+        if mask is None:
+            mask = torch.zeros_like(x, dtype=torch.bool)
+
+        if targets is None:
+            targets = x
+
+        x_in = x.clone()
+        x_in[mask] = 0.0
+
+        expr_input = torch.stack(
+            [x_in, mask.float()],
+            dim=-1,
+        )  # [B, G, 2]
+
+        gene_ids = torch.arange(G, device=x.device)
+
+        expr_embeddings = self.expression_encoder(expr_input)             # [B, G, D]
+        gene_embeddings = self.gene_embedding(gene_ids).unsqueeze(0)      # [1, G, D]
+
+        tokens = expr_embeddings + gene_embeddings                        # [B, G, D]
+
+        h = self.drop(tokens)
+        for block in self.h:
+            h = block(h)
+        h = self.ln_f(h)
+
+        pred = self.expression_decoder(h).squeeze(-1)                     # [B, G]
+
+        if mask.any():
+            loss = F.smooth_l1_loss(pred[mask], targets[mask])
+            return pred, h, loss
+
+        return pred, h
