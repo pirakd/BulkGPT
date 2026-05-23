@@ -5,9 +5,17 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14.3,<3.15"
 dependencies = [
+    "aiohttp>=3.13.5",
+    "archs4py>=1.0.4",
+    "ipykernel>=7.2.0",
     "matplotlib>=3.10.8",
     "numpy>=2.4.3",
+    "pyarrow>=24.0.0",
+    "pybiomart>=0.2.0",
+    "requests>=2.33.0",
+    "scanpy>=1.12.1",
     "tiktoken>=0.12.0",
     "torch>=2.11.0",
+    "tqdm>=4.67.3",
     "wandb>=0.26.0",
 ]
