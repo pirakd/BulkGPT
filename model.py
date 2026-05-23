@@ -280,6 +280,9 @@ class NanoBulkFM(nn.Module):
             nn.Linear(config.n_embd, 1),
         )
 
+    def get_num_params(self):
+        return sum(p.numel() for p in self.parameters())
+
     def forward(self, x, mask=None, targets=None):
         # x: [B, G]
         B, G = x.shape

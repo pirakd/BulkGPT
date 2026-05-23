@@ -89,9 +89,10 @@ def get_lr(it, cfg: TrainConfig):
 
 
 @torch.no_grad()
-def evaluate(model, loader, cfg: TrainConfig):
+def evaluate(model, loader, cfg: TrainConfig, gene_mean: torch.Tensor):
     model.eval()
     losses = []
+    preds_all, trues_all, means_all = [], [], []
     sample_pred = sample_true = None
     for i, x in enumerate(loader):
         if i >= cfg.eval_iters:
@@ -102,6 +103,10 @@ def evaluate(model, loader, cfg: TrainConfig):
             mask[:, 0] = True
         pred, _, loss = model(x, mask=mask)
         losses.append(loss.item())
+        baseline = gene_mean.unsqueeze(0).expand_as(x)
+        preds_all.append(pred[mask].cpu())
+        trues_all.append(x[mask].cpu())
+        means_all.append(baseline[mask].cpu())
         if sample_pred is None:
             b0 = 0
             masked_idx = mask[b0].nonzero(as_tuple=True)[0]
@@ -111,14 +116,23 @@ def evaluate(model, loader, cfg: TrainConfig):
                 pick = masked_idx[perm]
                 sample_pred = pred[b0, pick].cpu().numpy()
                 sample_true = x[b0, pick].cpu().numpy()
+                sample_base = gene_mean[pick].cpu().numpy()
                 sample_gene_idx = pick.cpu().numpy()
     if sample_pred is not None:
         print("  recovered vs true (masked genes):")
-        print(f"    {'gene_idx':>10} {'pred':>10} {'true':>10} {'err':>10}")
-        for g, p, t in zip(sample_gene_idx, sample_pred, sample_true):
-            print(f"    {int(g):>10d} {p:>10.4f} {t:>10.4f} {p - t:>+10.4f}")
+        print(f"    {'gene_idx':>10} {'pred':>10} {'true':>10} {'mean':>10} {'err':>10}")
+        for g, p, t, m in zip(sample_gene_idx, sample_pred, sample_true, sample_base):
+            print(f"    {int(g):>10d} {p:>10.4f} {t:>10.4f} {m:>10.4f} {p - t:>+10.4f}")
     model.train()
-    return float(np.mean(losses)) if losses else float("nan")
+    val = float(np.mean(losses)) if losses else float("nan")
+    p = torch.cat(preds_all).numpy()
+    t = torch.cat(trues_all).numpy()
+    m = torch.cat(means_all).numpy()
+    ss_res = float(((t - p) ** 2).sum())
+    ss_tot = float(((t - m) ** 2).sum())
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    pear = float(np.corrcoef(p, t)[0, 1])
+    return val, r2, pear
 
 
 def main():
@@ -150,6 +164,9 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False)
 
+    train_X = dataset.X[train_ds.indices]
+    gene_mean = train_X.mean(dim=0).to(cfg.device)
+
     model_cfg = NanoBulkFMConfig(
         n_genes=n_genes,
         n_layer=cfg.n_layer,
@@ -159,8 +176,7 @@ def main():
         bias=cfg.bias,
     )
     model = NanoBulkFM(model_cfg, device=cfg.device).to(cfg.device)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model params: {n_params:,}")
+    print(f"Model params: {model.get_num_params():,} | device: {cfg.device} | n_genes: {model_cfg.n_genes} | n_layer: {model_cfg.n_layer} | n_embd: {model_cfg.n_embd}")
 
     decay_params = [p for p in model.parameters() if p.requires_grad and p.dim() >= 2]
     nodecay_params = [p for p in model.parameters() if p.requires_grad and p.dim() < 2]
@@ -205,8 +221,8 @@ def main():
             print(f"iter {it:6d} | loss {loss.item():.4f} | lr {lr:.2e}")
 
         if it > 0 and it % cfg.eval_interval == 0:
-            val_loss = evaluate(model, val_loader, cfg)
-            print(f"iter {it:6d} | val loss {val_loss:.4f}")
+            val_loss, r2, pear = evaluate(model, val_loader, cfg, gene_mean)
+            print(f"iter {it:6d} | val loss {val_loss:.4f} | R²(vs mean) {r2:+.3f} | pearson_r {pear:+.3f}")
             if val_loss < best_val:
                 best_val = val_loss
                 ckpt = {
@@ -221,8 +237,8 @@ def main():
 
         it += 1
 
-    val_loss = evaluate(model, val_loader, cfg)
-    print(f"final val loss {val_loss:.4f} (best {best_val:.4f})")
+    val_loss, r2, pear = evaluate(model, val_loader, cfg, gene_mean)
+    print(f"final val {val_loss:.4f} | R²(vs mean) {r2:+.3f} | r {pear:+.3f} (best {best_val:.4f})")
 
 
 if __name__ == "__main__":
