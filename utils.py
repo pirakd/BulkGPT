@@ -1,4 +1,5 @@
 import h5py
+import numpy as np
 import pandas as pd
 
 HGNC_COMPLETE_SET_URL = (
@@ -13,7 +14,7 @@ def load_samples(archs4_path: str = "data/archs4/human_gene_v2.latest.h5") -> pd
 
     Returns:
         DataFrame with columns: geo_accession, library_strategy,
-        alignedreads, singlecellprobability.
+        alignedreads, singlecellprobability, platform_id.
     """
     with h5py.File(archs4_path, "r") as f:
         return pd.DataFrame({
@@ -21,6 +22,7 @@ def load_samples(archs4_path: str = "data/archs4/human_gene_v2.latest.h5") -> pd
             "library_strategy": f["meta/samples/library_strategy"][:].astype(str),
             "alignedreads": f["meta/samples/alignedreads"][:],
             "singlecellprobability": f["meta/samples/singlecellprobability"][:],
+            "platform_id": f["meta/samples/platform_id"][:].astype(str),
         })
 
 
@@ -43,6 +45,30 @@ def qc_samples(
     print(f"Aligned reads filter (>={min_aligned_reads:,}): {len(meta)}/{n}")
 
     return meta.reset_index(drop=True)
+
+
+def aggregate_duplicate_genes_lightweight(exp: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate duplicate gene rows without pandas groupby over the full matrix.
+
+    pandas groupby materializes large intermediate blocks for wide expression
+    matrices. This keeps the first copy of each gene row and only sums rows for
+    gene symbols that are actually duplicated.
+    """
+    index = pd.Index(exp.index)
+    if index.is_unique:
+        return exp
+
+    values = exp.to_numpy(copy=False)
+    duplicate_labels = index[index.duplicated(keep=False)].unique()
+    keep_mask = ~index.duplicated(keep="first")
+
+    for label in duplicate_labels:
+        row_positions = np.flatnonzero(index == label)
+        first = row_positions[0]
+        if len(row_positions) > 1:
+            values[first, :] = values[row_positions, :].sum(axis=0)
+
+    return exp.loc[keep_mask]
 
 
 def build_symbol_to_ensembl_hgnc() -> dict[str, str]:
