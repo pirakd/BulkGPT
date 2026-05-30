@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader, Dataset, random_split
 
 from model import NanoBulkFM, NanoBulkFMConfig
 
-DATA_PATH = "data/archs4/preprocessed.h5ad"
+DATA_PATH = "data/archs4/preprocessed_full.h5ad"
 OUT_DIR = "out/nano_bulk_fm"
 
 DEBUG = True
@@ -53,15 +53,13 @@ class DebugConfig(TrainConfig):
     n_head: int = 4
     n_embd: int = 128
     dropout: float = 0.0
-
-    batch_size: int = 8
+    batch_size: int = 16
     max_iters: int = 1000000
-    eval_interval: int = 100
-    eval_iters: int = 5
-    log_interval: int = 10
+    eval_interval: int = 200
+    eval_iters: int = 10
+    log_interval: int = 20
     warmup_iters: int = 5
-
-    n_samples_subset: int | None = 10000
+    n_samples_subset: int | None = 200000
 
 
 class ExpressionDataset(Dataset):
@@ -190,6 +188,7 @@ def main():
 
     best_val = float("inf")
     it = 0
+    steps_per_epoch = len(train_loader)
     train_iter = iter(train_loader)
     model.train()
 
@@ -217,12 +216,13 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
 
+        epoch = it / steps_per_epoch
         if it % cfg.log_interval == 0:
-            print(f"iter {it:6d} | loss {loss.item():.4f} | lr {lr:.2e}")
+            print(f"iter {it:6d} | epoch {epoch:.2f} | loss {loss.item():.4f} | lr {lr:.2e}")
 
         if it > 0 and it % cfg.eval_interval == 0:
             val_loss, r2, pear = evaluate(model, val_loader, cfg, gene_mean)
-            print(f"iter {it:6d} | val loss {val_loss:.4f} | R²(vs mean) {r2:+.3f} | pearson_r {pear:+.3f}")
+            print(f"iter {it:6d} | epoch {epoch:.2f} | val loss {val_loss:.4f} | R²(vs mean) {r2:+.3f} | pearson_r {pear:+.3f}")
             if val_loss < best_val:
                 best_val = val_loss
                 ckpt = {
@@ -238,7 +238,7 @@ def main():
         it += 1
 
     val_loss, r2, pear = evaluate(model, val_loader, cfg, gene_mean)
-    print(f"final val {val_loss:.4f} | R²(vs mean) {r2:+.3f} | r {pear:+.3f} (best {best_val:.4f})")
+    print(f"final iter {it:6d} | epoch {it / steps_per_epoch:.2f} | val {val_loss:.4f} | R²(vs mean) {r2:+.3f} | r {pear:+.3f} (best {best_val:.4f})")
 
 
 if __name__ == "__main__":
