@@ -1,10 +1,14 @@
 """Preprocess ARCHS4 expression: QC → TPM → log1p → slice to panel → h5ad."""
 import os
+import sys
+from pathlib import Path
 
 import anndata as ad
 import archs4py as a4
 import numpy as np
 import pandas as pd
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from utils import (
     aggregate_duplicate_genes_lightweight,

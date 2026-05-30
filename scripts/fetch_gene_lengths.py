@@ -1,8 +1,12 @@
 import os
+import sys
 from io import StringIO
+from pathlib import Path
 
 import pandas as pd
 import requests
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from utils import HGNC_COMPLETE_SET_URL, build_ensembl_to_symbols
 

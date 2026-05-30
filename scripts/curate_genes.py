@@ -1,8 +1,13 @@
 import re
+import sys
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import archs4py as a4
 from tqdm import tqdm
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from utils import build_ensembl_to_symbols, build_symbol_to_ensembl_hgnc, load_samples, qc_samples
 
