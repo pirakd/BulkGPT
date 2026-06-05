@@ -1,6 +1,6 @@
 """Train NanoBulkFM with masked expression modeling on preprocessed ARCHS4."""
+import argparse
 import math
-import os
 from dataclasses import dataclass
 
 import anndata as ad
@@ -9,15 +9,25 @@ import torch
 from torch.utils.data import DataLoader, Dataset, random_split
 
 from model import NanoBulkFM, NanoBulkFMConfig
+from utils import create_output_folder
 
 DATA_PATH = "data/archs4/preprocessed_full.h5ad"
-OUT_DIR = "out/nano_bulk_fm"
+HF_REPO_ID = "dpirak/ARCHS4_selected_genes"
+HF_FILENAME = "preprocessed_full.h5ad"
+OUT_ROOT = "out"
 
 DEBUG = True
 
 
 @dataclass
 class TrainConfig:
+    data_source: str = "local"
+    data_path: str = DATA_PATH
+    hf_repo_id: str = HF_REPO_ID
+    hf_filename: str = HF_FILENAME
+    hf_revision: str | None = None
+    hf_cache_dir: str | None = None
+
     n_layer: int = 6
     n_head: int = 8
     n_embd: int = 256
@@ -86,6 +96,85 @@ def get_lr(it, cfg: TrainConfig):
     return cfg.min_lr + coeff * (cfg.lr - cfg.min_lr)
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--data-source",
+        choices=("local", "hf"),
+        default=None,
+        help="Load data from a local h5ad file or a Hugging Face dataset.",
+    )
+    parser.add_argument(
+        "--data-path",
+        default=None,
+        help="Local h5ad path used when --data-source=local.",
+    )
+    parser.add_argument(
+        "--hf-repo-id",
+        default=None,
+        help="Hugging Face dataset repo id used when --data-source=hf.",
+    )
+    parser.add_argument(
+        "--hf-filename",
+        default=None,
+        help="File path inside the Hugging Face dataset repo.",
+    )
+    parser.add_argument(
+        "--hf-revision",
+        default=None,
+        help="Optional Hugging Face dataset revision, branch, or commit.",
+    )
+    parser.add_argument(
+        "--hf-cache-dir",
+        default=None,
+        help="Optional Hugging Face cache directory for downloaded data.",
+    )
+    parser.add_argument(
+        "--debug",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use DebugConfig defaults. Defaults to the DEBUG constant.",
+    )
+    return parser.parse_args()
+
+
+def build_config(args) -> TrainConfig:
+    use_debug = DEBUG if args.debug is None else args.debug
+    cfg = DebugConfig() if use_debug else TrainConfig()
+    for field in (
+        "data_source",
+        "data_path",
+        "hf_repo_id",
+        "hf_filename",
+        "hf_revision",
+        "hf_cache_dir",
+    ):
+        value = getattr(args, field)
+        if value is not None:
+            setattr(cfg, field, value)
+    return cfg
+
+
+def resolve_data_path(cfg: TrainConfig) -> str:
+    if cfg.data_source == "local":
+        return cfg.data_path
+    if cfg.data_source != "hf":
+        raise ValueError(f"Unknown data_source: {cfg.data_source}")
+
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as exc:
+        raise ImportError("Install huggingface_hub to load data from Hugging Face.") from exc
+
+    return hf_hub_download(
+        repo_id=cfg.hf_repo_id,
+        filename=cfg.hf_filename,
+        repo_type="dataset",
+        revision=cfg.hf_revision,
+        cache_dir=cfg.hf_cache_dir,
+    )
+
+
 @torch.no_grad()
 def evaluate(model, loader, cfg: TrainConfig, gene_mean: torch.Tensor):
     model.eval()
@@ -134,13 +223,15 @@ def evaluate(model, loader, cfg: TrainConfig, gene_mean: torch.Tensor):
 
 
 def main():
-    cfg = DebugConfig() if DEBUG else TrainConfig()
+    cfg = build_config(parse_args())
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
-    os.makedirs(OUT_DIR, exist_ok=True)
+    out_dir = create_output_folder(OUT_ROOT)
+    print(f"Output dir: {out_dir}")
 
-    print(f"Loading {DATA_PATH}...")
-    adata = ad.read_h5ad(DATA_PATH)
+    data_path = resolve_data_path(cfg)
+    print(f"Loading {data_path}...")
+    adata = ad.read_h5ad(data_path)
     X = adata.X
     if not isinstance(X, np.ndarray):
         X = X.toarray()
@@ -232,7 +323,7 @@ def main():
                     "iter": it,
                     "val_loss": val_loss,
                 }
-                torch.save(ckpt, os.path.join(OUT_DIR, "ckpt.pt"))
+                torch.save(ckpt, out_dir / "ckpt.pt")
                 print(f"  saved checkpoint (val {val_loss:.4f})")
 
         it += 1
