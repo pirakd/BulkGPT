@@ -1,3 +1,7 @@
+import inspect
+from datetime import datetime
+from pathlib import Path
+
 import h5py
 import numpy as np
 import pandas as pd
@@ -5,6 +9,21 @@ import pandas as pd
 HGNC_COMPLETE_SET_URL = (
     "https://storage.googleapis.com/public-download-files/hgnc/tsv/tsv/hgnc_complete_set.txt"
 )
+
+
+def create_output_folder(output_folder: str | Path) -> Path:
+    """Create output_folder/<caller-file-stem>/<timestamp>/ and return it.
+
+    Groups each script's outputs under a folder named after the calling file,
+    with a per-run timestamp leaf so repeated runs don't overwrite each other.
+
+    Returns:
+        Path to the created timestamp folder.
+    """
+    caller_stem = Path(inspect.stack()[1].filename).stem
+    run_dir = Path(output_folder) / caller_stem / datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
 
 def load_samples(archs4_path: str = "data/archs4/human_gene_v2.latest.h5") -> pd.DataFrame:
     """Load sample-level metadata from an ARCHS4 HDF5 file.
