@@ -1,6 +1,7 @@
 """Train NanoBulkFM with masked expression modeling on preprocessed ARCHS4."""
 import argparse
 import math
+import sys
 from dataclasses import dataclass
 
 import anndata as ad
@@ -17,6 +18,22 @@ HF_FILENAME = "preprocessed_full.h5ad"
 OUT_ROOT = "out"
 
 DEBUG = True
+
+
+class _Tee:
+    """Duplicate writes to several streams (e.g. console + log file)."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+            s.flush()  # flush per write so the log survives a crash
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
 
 
 @dataclass
@@ -227,6 +244,9 @@ def main():
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
     out_dir = create_output_folder(OUT_ROOT)
+    log_file = open(out_dir / "train.log", "w")
+    sys.stdout = _Tee(sys.__stdout__, log_file)
+    sys.stderr = _Tee(sys.__stderr__, log_file)
     print(f"Output dir: {out_dir}")
 
     data_path = resolve_data_path(cfg)
