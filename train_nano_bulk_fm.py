@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import anndata as ad
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset, random_split
 
@@ -16,6 +17,7 @@ DATA_PATH = "data/archs4/preprocessed_full.h5ad"
 HF_REPO_ID = "dpirak/ARCHS4_selected_genes"
 HF_FILENAME = "preprocessed_full.h5ad"
 OUT_ROOT = "out"
+ESM_EMBEDDINGS_PATH = "data/genes/build_gene_protein_embeddings/20260609_114706/protein_coding_gene_esm2_embeddings.parquet"
 
 DEBUG = True
 
@@ -44,6 +46,8 @@ class TrainConfig:
     hf_filename: str = HF_FILENAME
     hf_revision: str | None = None
     hf_cache_dir: str | None = None
+
+    use_esm_embeddings: bool = True
 
     n_layer: int = 3
     n_head: int = 4
@@ -102,6 +106,22 @@ class ExpressionDataset(Dataset):
 
 def make_mask(shape, ratio, device):
     return torch.rand(shape, device=device) < ratio
+
+
+def load_esm_gene_embeddings(var_names, embeddings_path):
+    """Load per-gene ESM2 embeddings aligned to var_names (Ensembl gene IDs)."""
+    df = pd.read_parquet(embeddings_path).set_index("ensembl_gene_id")
+    dim = len(df["embedding"].iloc[0])
+    aligned = np.zeros((len(var_names), dim), dtype=np.float32)
+    missing = 0
+    for i, gene_id in enumerate(var_names):
+        if gene_id in df.index:
+            aligned[i] = df.loc[gene_id, "embedding"]
+        else:
+            missing += 1
+    if missing:
+        print(f"Warning: missing ESM embeddings for {missing}/{len(var_names)} genes; using zeros.")
+    return torch.from_numpy(aligned)
 
 
 def get_lr(it, cfg: TrainConfig):
@@ -276,6 +296,10 @@ def main():
     train_X = dataset.X[train_ds.indices]
     gene_mean = train_X.mean(dim=0).to(cfg.device)
 
+    esm_gene_embeddings = None
+    if cfg.use_esm_embeddings:
+        esm_gene_embeddings = load_esm_gene_embeddings(adata.var_names, ESM_EMBEDDINGS_PATH)
+
     model_cfg = NanoBulkFMConfig(
         n_genes=n_genes,
         n_layer=cfg.n_layer,
@@ -283,8 +307,10 @@ def main():
         n_embd=cfg.n_embd,
         dropout=cfg.dropout,
         bias=cfg.bias,
+        use_esm_embeddings=cfg.use_esm_embeddings,
+        esm_embedding_dim=esm_gene_embeddings.shape[1] if esm_gene_embeddings is not None else None,
     )
-    model = NanoBulkFM(model_cfg, device=cfg.device).to(cfg.device)
+    model = NanoBulkFM(model_cfg, device=cfg.device, esm_gene_embeddings=esm_gene_embeddings).to(cfg.device)
     print(f"Model params: {model.get_num_params():,} | device: {cfg.device} | n_genes: {model_cfg.n_genes} | n_layer: {model_cfg.n_layer} | n_embd: {model_cfg.n_embd}")
 
     decay_params = [p for p in model.parameters() if p.requires_grad and p.dim() >= 2]
