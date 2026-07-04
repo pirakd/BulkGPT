@@ -45,13 +45,13 @@ class TrainConfig:
     hf_revision: str | None = None
     hf_cache_dir: str | None = None
 
-    n_layer: int = 6
-    n_head: int = 8
-    n_embd: int = 256
-    dropout: float = 0.1
+    n_layer: int = 3
+    n_head: int = 4
+    n_embd: int = 128
+    dropout: float = 0.0
     bias: bool = True
 
-    mask_ratio: float = 0.15
+    mask_ratio: float = 0.30
     batch_size: int = 32
     val_frac: float = 0.05
     max_iters: int = 20000
@@ -59,10 +59,10 @@ class TrainConfig:
     eval_iters: int = 50
     log_interval: int = 50
 
-    lr: float = 3e-4
-    min_lr: float = 3e-5
-    warmup_iters: int = 500
-    weight_decay: float = 0.1
+    lr: float = 3e-3
+    min_lr: float = 3e-4
+    warmup_iters: int = 100
+    weight_decay: float = 0.01
     betas: tuple = (0.9, 0.95)
     grad_clip: float = 1.0
 
