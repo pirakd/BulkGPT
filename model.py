@@ -250,14 +250,18 @@ class NanoBulkFMConfig:
     n_embd: int
     dropout: float
     bias: bool
+    use_esm_embeddings: bool = False
+    esm_embedding_dim: int | None = None
 
     def __post_init__(self):
         self.block_size = self.n_genes
         self.causal = False
+        if self.use_esm_embeddings and self.esm_embedding_dim is None:
+            raise ValueError("esm_embedding_dim must be set when use_esm_embeddings=True")
 
 
 class NanoBulkFM(nn.Module):
-    def __init__(self, config: NanoBulkFMConfig, device="cpu"):
+    def __init__(self, config: NanoBulkFMConfig, device="cpu", esm_gene_embeddings=None):
         super().__init__()
         self.config = config
         self.device = device
@@ -269,6 +273,18 @@ class NanoBulkFM(nn.Module):
         )
 
         self.gene_embedding = nn.Embedding(config.n_genes, config.n_embd)
+        if config.use_esm_embeddings:
+            if esm_gene_embeddings is None:
+                raise ValueError("esm_gene_embeddings must be provided when use_esm_embeddings=True")
+            self.register_buffer("esm_gene_embeddings", esm_gene_embeddings.float())
+            self.esm_projection = nn.Sequential(
+                nn.Linear(config.esm_embedding_dim, 4 * config.n_embd),
+                nn.GELU(),
+                nn.Linear(4 * config.n_embd, config.n_embd),
+            )
+        else:
+            self.register_buffer("esm_gene_embeddings", None)
+            self.esm_projection = None
 
         self.drop = nn.Dropout(config.dropout)
         self.h = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
@@ -305,6 +321,9 @@ class NanoBulkFM(nn.Module):
         gene_ids = torch.arange(G, device=x.device)
 
         expr_embeddings = self.expression_encoder(expr_input)             # [B, G, D]
+        if self.config.use_esm_embeddings:
+            esm_embeddings = self.esm_projection(self.esm_gene_embeddings).unsqueeze(0)
+            expr_embeddings = expr_embeddings + esm_embeddings
         gene_embeddings = self.gene_embedding(gene_ids).unsqueeze(0)      # [1, G, D]
 
         tokens = expr_embeddings + gene_embeddings                        # [B, G, D]
