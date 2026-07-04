@@ -14,10 +14,12 @@ from model import NanoBulkFM, NanoBulkFMConfig
 from utils import create_output_folder
 
 DATA_PATH = "data/archs4/preprocessed_full.h5ad"
-HF_REPO_ID = "dpirak/ARCHS4_selected_genes"
+HF_REPO_ID = "dpirak/nanobulkFM"
 HF_FILENAME = "preprocessed_full.h5ad"
 OUT_ROOT = "out"
 ESM_EMBEDDINGS_PATH = "data/genes/build_gene_protein_embeddings/20260609_114706/protein_coding_gene_esm2_embeddings.parquet"
+ESM_HF_REPO_ID = "dpirak/nanobulkFM"
+ESM_HF_FILENAME = "protein_coding_gene_esm2_embeddings.parquet"
 
 DEBUG = True
 
@@ -48,6 +50,12 @@ class TrainConfig:
     hf_cache_dir: str | None = None
 
     use_esm_embeddings: bool = True
+    esm_data_source: str = "local"
+    esm_embeddings_path: str = ESM_EMBEDDINGS_PATH
+    esm_hf_repo_id: str = ESM_HF_REPO_ID
+    esm_hf_filename: str = ESM_HF_FILENAME
+    esm_hf_revision: str | None = None
+    esm_hf_cache_dir: str | None = None
 
     n_layer: int = 3
     n_head: int = 4
@@ -167,6 +175,37 @@ def parse_args():
         help="Optional Hugging Face cache directory for downloaded data.",
     )
     parser.add_argument(
+        "--esm-data-source",
+        choices=("local", "hf"),
+        default=None,
+        help="Load ESM gene embeddings from a local parquet file or a Hugging Face dataset.",
+    )
+    parser.add_argument(
+        "--esm-embeddings-path",
+        default=None,
+        help="Local parquet path used when --esm-data-source=local.",
+    )
+    parser.add_argument(
+        "--esm-hf-repo-id",
+        default=None,
+        help="Hugging Face dataset repo id used when --esm-data-source=hf.",
+    )
+    parser.add_argument(
+        "--esm-hf-filename",
+        default=None,
+        help="File path inside the Hugging Face dataset repo for ESM embeddings.",
+    )
+    parser.add_argument(
+        "--esm-hf-revision",
+        default=None,
+        help="Optional Hugging Face dataset revision, branch, or commit for ESM embeddings.",
+    )
+    parser.add_argument(
+        "--esm-hf-cache-dir",
+        default=None,
+        help="Optional Hugging Face cache directory for downloaded ESM embeddings.",
+    )
+    parser.add_argument(
         "--debug",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -185,6 +224,12 @@ def build_config(args) -> TrainConfig:
         "hf_filename",
         "hf_revision",
         "hf_cache_dir",
+        "esm_data_source",
+        "esm_embeddings_path",
+        "esm_hf_repo_id",
+        "esm_hf_filename",
+        "esm_hf_revision",
+        "esm_hf_cache_dir",
     ):
         value = getattr(args, field)
         if value is not None:
@@ -209,6 +254,26 @@ def resolve_data_path(cfg: TrainConfig) -> str:
         repo_type="dataset",
         revision=cfg.hf_revision,
         cache_dir=cfg.hf_cache_dir,
+    )
+
+
+def resolve_esm_embeddings_path(cfg: TrainConfig) -> str:
+    if cfg.esm_data_source == "local":
+        return cfg.esm_embeddings_path
+    if cfg.esm_data_source != "hf":
+        raise ValueError(f"Unknown esm_data_source: {cfg.esm_data_source}")
+
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as exc:
+        raise ImportError("Install huggingface_hub to load data from Hugging Face.") from exc
+
+    return hf_hub_download(
+        repo_id=cfg.esm_hf_repo_id,
+        filename=cfg.esm_hf_filename,
+        repo_type="dataset",
+        revision=cfg.esm_hf_revision,
+        cache_dir=cfg.esm_hf_cache_dir,
     )
 
 
@@ -298,7 +363,9 @@ def main():
 
     esm_gene_embeddings = None
     if cfg.use_esm_embeddings:
-        esm_gene_embeddings = load_esm_gene_embeddings(adata.var_names, ESM_EMBEDDINGS_PATH)
+        esm_path = resolve_esm_embeddings_path(cfg)
+        print(f"Loading ESM embeddings from {esm_path}...")
+        esm_gene_embeddings = load_esm_gene_embeddings(adata.var_names, esm_path)
 
     model_cfg = NanoBulkFMConfig(
         n_genes=n_genes,
