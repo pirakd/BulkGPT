@@ -225,43 +225,21 @@ def build_config(args) -> SimpleNamespace:
     return cfg
 
 
-def resolve_data_path(cfg: SimpleNamespace) -> str:
-    if cfg.data_source == "local":
-        return cfg.data_path
-    if cfg.data_source != "hf":
-        raise ValueError(f"Unknown data_source: {cfg.data_source}")
+def resolve_path(cfg: SimpleNamespace, source_attr: str, local_attr: str, hf_prefix: str) -> str:
+    source = getattr(cfg, source_attr)
+    if source == "local":
+        return getattr(cfg, local_attr)
+    if source != "hf":
+        raise ValueError(f"Unknown {source_attr}: {source}")
 
-    try:
-        from huggingface_hub import hf_hub_download
-    except ImportError as exc:
-        raise ImportError("Install huggingface_hub to load data from Hugging Face.") from exc
+    from huggingface_hub import hf_hub_download
 
     return hf_hub_download(
-        repo_id=cfg.hf_repo_id,
-        filename=cfg.hf_filename,
+        repo_id=getattr(cfg, f"{hf_prefix}repo_id"),
+        filename=getattr(cfg, f"{hf_prefix}filename"),
         repo_type="dataset",
-        revision=cfg.hf_revision,
-        cache_dir=cfg.hf_cache_dir,
-    )
-
-
-def resolve_esm_embeddings_path(cfg: SimpleNamespace) -> str:
-    if cfg.esm_data_source == "local":
-        return cfg.esm_embeddings_path
-    if cfg.esm_data_source != "hf":
-        raise ValueError(f"Unknown esm_data_source: {cfg.esm_data_source}")
-
-    try:
-        from huggingface_hub import hf_hub_download
-    except ImportError as exc:
-        raise ImportError("Install huggingface_hub to load data from Hugging Face.") from exc
-
-    return hf_hub_download(
-        repo_id=cfg.esm_hf_repo_id,
-        filename=cfg.esm_hf_filename,
-        repo_type="dataset",
-        revision=cfg.esm_hf_revision,
-        cache_dir=cfg.esm_hf_cache_dir,
+        revision=getattr(cfg, f"{hf_prefix}revision"),
+        cache_dir=getattr(cfg, f"{hf_prefix}cache_dir"),
     )
 
 
@@ -334,7 +312,7 @@ def main():
         yaml.safe_dump(cfg_dict, f, sort_keys=False)
     print(f"Saved resolved run config to {out_dir / 'config.yaml'}")
 
-    data_path = resolve_data_path(cfg)
+    data_path = resolve_path(cfg, "data_source", "data_path", "hf_")
     print(f"Loading {data_path}...")
     adata = ad.read_h5ad(data_path)
     X = adata.X
@@ -363,7 +341,7 @@ def main():
 
     esm_gene_embeddings = None
     if cfg.use_esm_embeddings:
-        esm_path = resolve_esm_embeddings_path(cfg)
+        esm_path = resolve_path(cfg, "esm_data_source", "esm_embeddings_path", "esm_hf_")
         print(f"Loading ESM embeddings from {esm_path}...")
         esm_gene_embeddings = load_esm_gene_embeddings(adata.var_names, esm_path)
 
