@@ -311,6 +311,8 @@ def main():
         esm_embedding_dim=esm_gene_embeddings.shape[1] if esm_gene_embeddings is not None else None,
     )
     model = NanoBulkFM(model_cfg, device=cfg.device, esm_gene_embeddings=esm_gene_embeddings).to(cfg.device)
+    if cfg.device.startswith("cuda"):
+        model = torch.compile(model)
     print(f"Model params: {model.get_num_params():,} | device: {cfg.device} | n_genes: {model_cfg.n_genes} | n_layer: {model_cfg.n_layer} | n_embd: {model_cfg.n_embd}")
 
     decay_params = [p for p in model.parameters() if p.requires_grad and p.dim() >= 2]
@@ -322,6 +324,9 @@ def main():
         ],
         lr=cfg.lr, betas=cfg.betas,
     )
+
+    use_amp = cfg.device.startswith("cuda")
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
     best_val = float("inf")
     it = 0
@@ -345,13 +350,22 @@ def main():
         if not mask.any():
             mask[:, 0] = True
 
-        _, _, loss = model(x, mask=mask)
-
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        if cfg.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-        optimizer.step()
+        if use_amp:
+            with torch.amp.autocast("cuda", dtype=torch.float16):
+                _, _, loss = model(x, mask=mask)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            if cfg.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            _, _, loss = model(x, mask=mask)
+            loss.backward()
+            if cfg.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            optimizer.step()
 
         epoch = it / steps_per_epoch
         if it % cfg.log_interval == 0:
