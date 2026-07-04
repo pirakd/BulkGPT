@@ -2,26 +2,21 @@
 import argparse
 import math
 import sys
-from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
 
 import anndata as ad
 import numpy as np
 import pandas as pd
 import torch
+import yaml
 from torch.utils.data import DataLoader, Dataset, random_split
 
 from model import NanoBulkFM, NanoBulkFMConfig
 from utils import create_output_folder
 
-DATA_PATH = "data/archs4/preprocessed_full.h5ad"
-HF_REPO_ID = "dpirak/nanobulkFM"
-HF_FILENAME = "preprocessed_full.h5ad"
 OUT_ROOT = "out"
-ESM_EMBEDDINGS_PATH = "data/genes/build_gene_protein_embeddings/20260609_114706/protein_coding_gene_esm2_embeddings.parquet"
-ESM_HF_REPO_ID = "dpirak/nanobulkFM"
-ESM_HF_FILENAME = "protein_coding_gene_esm2_embeddings.parquet"
-
-DEBUG = True
+DEFAULT_CONFIG_PATH = "configs/train_nano_bulk_fm.yaml"
 
 
 class _Tee:
@@ -38,67 +33,6 @@ class _Tee:
     def flush(self):
         for s in self.streams:
             s.flush()
-
-
-@dataclass
-class TrainConfig:
-    data_source: str = "local"
-    data_path: str = DATA_PATH
-    hf_repo_id: str = HF_REPO_ID
-    hf_filename: str = HF_FILENAME
-    hf_revision: str | None = None
-    hf_cache_dir: str | None = None
-
-    use_esm_embeddings: bool = True
-    esm_data_source: str = "local"
-    esm_embeddings_path: str = ESM_EMBEDDINGS_PATH
-    esm_hf_repo_id: str = ESM_HF_REPO_ID
-    esm_hf_filename: str = ESM_HF_FILENAME
-    esm_hf_revision: str | None = None
-    esm_hf_cache_dir: str | None = None
-
-    n_layer: int = 3
-    n_head: int = 4
-    n_embd: int = 128
-    dropout: float = 0.0
-    bias: bool = True
-
-    mask_ratio: float = 0.30
-    batch_size: int = 32
-    val_frac: float = 0.05
-    max_iters: int = 20000
-    eval_interval: int = 500
-    eval_iters: int = 50
-    log_interval: int = 50
-
-    lr: float = 3e-3
-    min_lr: float = 3e-4
-    warmup_iters: int = 100
-    weight_decay: float = 0.01
-    betas: tuple = (0.9, 0.95)
-    grad_clip: float = 1.0
-
-    n_samples_subset: int | None = None
-
-    seed: int = 42
-    device: str = "mps" if torch.backends.mps.is_available() else (
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
-
-
-@dataclass
-class DebugConfig(TrainConfig):
-    n_layer: int = 3
-    n_head: int = 4
-    n_embd: int = 128
-    dropout: float = 0.0
-    batch_size: int = 16
-    max_iters: int = 1000000
-    eval_interval: int = 200
-    eval_iters: int = 10
-    log_interval: int = 20
-    warmup_iters: int = 5
-    n_samples_subset: int | None = 200000
 
 
 class ExpressionDataset(Dataset):
@@ -132,10 +66,19 @@ def load_esm_gene_embeddings(var_names, embeddings_path):
     return torch.from_numpy(aligned)
 
 
-def get_lr(it, cfg: TrainConfig):
+def get_lr(it, cfg: SimpleNamespace, lr_decay_iters: int):
+    """Warmup + cosine decay, annealed over `lr_decay_iters` (not `max_iters`).
+
+    `lr_decay_iters` is the schedule horizon fixed the first time a run
+    starts and carried forward silently through the checkpoint (see
+    `main`). Keeping it separate from `max_iters` means extending
+    `max_iters` to continue a run (e.g. after --resume) does not
+    retroactively reshape the schedule and spike the LR back up. Once `it`
+    passes `lr_decay_iters`, LR just stays flat at `min_lr`.
+    """
     if it < cfg.warmup_iters:
         return cfg.lr * (it + 1) / cfg.warmup_iters
-    progress = (it - cfg.warmup_iters) / max(1, cfg.max_iters - cfg.warmup_iters)
+    progress = (it - cfg.warmup_iters) / max(1, lr_decay_iters - cfg.warmup_iters)
     progress = min(1.0, progress)
     coeff = 0.5 * (1.0 + math.cos(math.pi * progress))
     return cfg.min_lr + coeff * (cfg.lr - cfg.min_lr)
@@ -143,6 +86,11 @@ def get_lr(it, cfg: TrainConfig):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config",
+        default=DEFAULT_CONFIG_PATH,
+        help="Path to a YAML config file with all run parameters. CLI flags override it.",
+    )
     parser.add_argument(
         "--data-source",
         choices=("local", "hf"),
@@ -206,17 +154,49 @@ def parse_args():
         help="Optional Hugging Face cache directory for downloaded ESM embeddings.",
     )
     parser.add_argument(
-        "--debug",
-        action=argparse.BooleanOptionalAction,
+        "--resume",
+        action="store_true",
+        help="Continue training from an existing run. Requires --resume-dir.",
+    )
+    parser.add_argument(
+        "--resume-dir",
         default=None,
-        help="Use DebugConfig defaults. Defaults to the DEBUG constant.",
+        help=(
+            "Path to an existing run's output folder (containing ckpt.pt and "
+            "config.yaml) to resume training from. Used with --resume."
+        ),
     )
     return parser.parse_args()
 
 
-def build_config(args) -> TrainConfig:
-    use_debug = DEBUG if args.debug is None else args.debug
-    cfg = DebugConfig() if use_debug else TrainConfig()
+def build_config(args) -> SimpleNamespace:
+    # --resume-dir passed on the CLI takes priority over one set in a config
+    # file for deciding *which* config file to load in the first place.
+    resuming = args.resume or bool(args.resume_dir)
+    if resuming:
+        if not args.resume_dir:
+            raise ValueError("--resume requires --resume-dir to point at an existing run folder.")
+        # Default to the resumed run's own resolved config unless the caller
+        # explicitly passed a different --config.
+        if args.config == DEFAULT_CONFIG_PATH:
+            config_path = Path(args.resume_dir) / "config.yaml"
+        else:
+            config_path = Path(args.config)
+    else:
+        config_path = Path(args.config)
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    with open(config_path) as f:
+        data = yaml.safe_load(f) or {}
+
+    if data.get("betas") is not None:
+        data["betas"] = tuple(data["betas"])
+    if not data.get("device"):
+        data["device"] = "mps" if torch.backends.mps.is_available() else (
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+
+    cfg = SimpleNamespace(**data)
     for field in (
         "data_source",
         "data_path",
@@ -234,10 +214,18 @@ def build_config(args) -> TrainConfig:
         value = getattr(args, field)
         if value is not None:
             setattr(cfg, field, value)
+
+    # `resume`/`resume_dir` may come from the config file (data.get) or the
+    # CLI (args); the CLI flag can only turn resuming *on*, never off, since
+    # argparse's store_true has no way to represent "explicitly False".
+    cfg.resume = bool(args.resume or data.get("resume", False))
+    cfg.resume_dir = args.resume_dir if args.resume_dir is not None else data.get("resume_dir")
+    if cfg.resume and not cfg.resume_dir:
+        raise ValueError("resume requires resume_dir to be set (via --resume-dir or the config file).")
     return cfg
 
 
-def resolve_data_path(cfg: TrainConfig) -> str:
+def resolve_data_path(cfg: SimpleNamespace) -> str:
     if cfg.data_source == "local":
         return cfg.data_path
     if cfg.data_source != "hf":
@@ -257,7 +245,7 @@ def resolve_data_path(cfg: TrainConfig) -> str:
     )
 
 
-def resolve_esm_embeddings_path(cfg: TrainConfig) -> str:
+def resolve_esm_embeddings_path(cfg: SimpleNamespace) -> str:
     if cfg.esm_data_source == "local":
         return cfg.esm_embeddings_path
     if cfg.esm_data_source != "hf":
@@ -278,7 +266,7 @@ def resolve_esm_embeddings_path(cfg: TrainConfig) -> str:
 
 
 @torch.no_grad()
-def evaluate(model, loader, cfg: TrainConfig, gene_mean: torch.Tensor):
+def evaluate(model, loader, cfg: SimpleNamespace, gene_mean: torch.Tensor):
     model.eval()
     losses = []
     preds_all, trues_all, means_all = [], [], []
@@ -325,14 +313,26 @@ def evaluate(model, loader, cfg: TrainConfig, gene_mean: torch.Tensor):
 
 
 def main():
-    cfg = build_config(parse_args())
+    args = parse_args()
+    cfg = build_config(args)
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
+
+    if cfg.resume:
+        resume_from_dir = Path(cfg.resume_dir)
+        if not resume_from_dir.is_dir():
+            raise FileNotFoundError(f"resume_dir does not exist: {resume_from_dir}")
     out_dir = create_output_folder(OUT_ROOT)
     log_file = open(out_dir / "train.log", "w")
     sys.stdout = _Tee(sys.__stdout__, log_file)
     sys.stderr = _Tee(sys.__stderr__, log_file)
-    print(f"Output dir: {out_dir}")
+    print(f"Output dir: {out_dir}" + (f" (resuming from {cfg.resume_dir})" if cfg.resume else ""))
+
+    cfg_dict = vars(cfg).copy() 
+    cfg_dict["betas"] = list(cfg_dict["betas"])
+    with open(out_dir / "config.yaml", "w") as f:
+        yaml.safe_dump(cfg_dict, f, sort_keys=False)
+    print(f"Saved resolved run config to {out_dir / 'config.yaml'}")
 
     data_path = resolve_data_path(cfg)
     print(f"Loading {data_path}...")
@@ -397,6 +397,24 @@ def main():
 
     best_val = float("inf")
     it = 0
+    # The LR schedule horizon defaults to max_iters the first time a run
+    # starts, then is carried forward via the checkpoint on every --resume.
+    # This way, bumping max_iters later to train longer doesn't reshape or
+    # restart the cosine decay (the user never needs to think about this).
+    lr_decay_iters = cfg.max_iters
+    if cfg.resume:
+        ckpt_path = resume_from_dir / "ckpt.pt"
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"No checkpoint found to resume from: {ckpt_path}")
+        print(f"Loading checkpoint {ckpt_path} to resume training...")
+        ckpt = torch.load(ckpt_path, map_location=cfg.device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        best_val = ckpt.get("val_loss", float("inf"))
+        it = ckpt.get("iter", -1) + 1
+        lr_decay_iters = ckpt.get("lr_decay_iters", lr_decay_iters)
+        print(f"  resuming from iter {it} (best val so far {best_val:.4f})")
+
     steps_per_epoch = len(train_loader)
     train_iter = iter(train_loader)
     model.train()
@@ -408,7 +426,7 @@ def main():
             train_iter = iter(train_loader)
             x = next(train_iter)
 
-        lr = get_lr(it, cfg)
+        lr = get_lr(it, cfg, lr_decay_iters)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
@@ -447,8 +465,10 @@ def main():
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "model_cfg": model_cfg.__dict__,
+                    "gene_ids": list(adata.var_names),
                     "iter": it,
                     "val_loss": val_loss,
+                    "lr_decay_iters": lr_decay_iters,
                 }
                 torch.save(ckpt, out_dir / "ckpt.pt")
                 print(f"  saved checkpoint (val {val_loss:.4f})")
