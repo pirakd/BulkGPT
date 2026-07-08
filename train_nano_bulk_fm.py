@@ -1,6 +1,6 @@
 """Train NanoBulkFM with masked expression modeling on preprocessed ARCHS4."""
 import argparse
-import math
+import dataclasses
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +12,7 @@ import torch
 import yaml
 from torch.utils.data import DataLoader, Dataset, random_split
 
+from lr_schedule import LRScheduleConfig, ReduceLROnPlateauLR
 from model import NanoBulkFM, NanoBulkFMConfig
 from utils import create_output_folder
 
@@ -64,24 +65,6 @@ def load_esm_gene_embeddings(var_names, embeddings_path):
     if missing:
         print(f"Warning: missing ESM embeddings for {missing}/{len(var_names)} genes; using zeros.")
     return torch.from_numpy(aligned)
-
-
-def get_lr(it, cfg: SimpleNamespace, lr_decay_iters: int):
-    """Warmup + cosine decay, annealed over `lr_decay_iters` (not `max_iters`).
-
-    `lr_decay_iters` is the schedule horizon fixed the first time a run
-    starts and carried forward silently through the checkpoint (see
-    `main`). Keeping it separate from `max_iters` means extending
-    `max_iters` to continue a run (e.g. after --resume) does not
-    retroactively reshape the schedule and spike the LR back up. Once `it`
-    passes `lr_decay_iters`, LR just stays flat at `min_lr`.
-    """
-    if it < cfg.warmup_iters:
-        return cfg.lr * (it + 1) / cfg.warmup_iters
-    progress = (it - cfg.warmup_iters) / max(1, lr_decay_iters - cfg.warmup_iters)
-    progress = min(1.0, progress)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * progress))
-    return cfg.min_lr + coeff * (cfg.lr - cfg.min_lr)
 
 
 def parse_args():
@@ -196,7 +179,15 @@ def build_config(args) -> SimpleNamespace:
             "cuda" if torch.cuda.is_available() else "cpu"
         )
 
+    if not data.get("lr_schedule"):
+        raise ValueError(
+            "Config is missing an `lr_schedule:` section (see lr_schedule.py "
+            "and configs/train_nano_bulk_fm.yaml for the expected fields)."
+        )
+    lr_schedule = LRScheduleConfig(**data.pop("lr_schedule"))
+
     cfg = SimpleNamespace(**data)
+    cfg.lr_schedule = lr_schedule
     for field in (
         "data_source",
         "data_path",
@@ -306,8 +297,9 @@ def main():
     sys.stderr = _Tee(sys.__stderr__, log_file)
     print(f"Output dir: {out_dir}" + (f" (resuming from {cfg.resume_dir})" if cfg.resume else ""))
 
-    cfg_dict = vars(cfg).copy() 
+    cfg_dict = vars(cfg).copy()
     cfg_dict["betas"] = list(cfg_dict["betas"])
+    cfg_dict["lr_schedule"] = dataclasses.asdict(cfg.lr_schedule)
     with open(out_dir / "config.yaml", "w") as f:
         yaml.safe_dump(cfg_dict, f, sort_keys=False)
     print(f"Saved resolved run config to {out_dir / 'config.yaml'}")
@@ -367,19 +359,15 @@ def main():
             {"params": decay_params, "weight_decay": cfg.weight_decay},
             {"params": nodecay_params, "weight_decay": 0.0},
         ],
-        lr=cfg.lr, betas=cfg.betas,
+        lr=cfg.lr_schedule.base_lr, betas=cfg.betas,
     )
+    lr_scheduler = ReduceLROnPlateauLR(cfg.lr_schedule)
 
     use_amp = cfg.device.startswith("cuda")
     scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
     best_val = float("inf")
     it = 0
-    # The LR schedule horizon defaults to max_iters the first time a run
-    # starts, then is carried forward via the checkpoint on every --resume.
-    # This way, bumping max_iters later to train longer doesn't reshape or
-    # restart the cosine decay (the user never needs to think about this).
-    lr_decay_iters = cfg.max_iters
     if cfg.resume:
         ckpt_path = resume_from_dir / "ckpt.pt"
         if not ckpt_path.is_file():
@@ -390,7 +378,8 @@ def main():
         optimizer.load_state_dict(ckpt["optimizer"])
         best_val = ckpt.get("val_loss", float("inf"))
         it = ckpt.get("iter", -1) + 1
-        lr_decay_iters = ckpt.get("lr_decay_iters", lr_decay_iters)
+        if "lr_schedule_state" in ckpt:
+            lr_scheduler.load_state_dict(ckpt["lr_schedule_state"])
         print(f"  resuming from iter {it} (best val so far {best_val:.4f})")
 
     steps_per_epoch = len(train_loader)
@@ -404,7 +393,7 @@ def main():
             train_iter = iter(train_loader)
             x = next(train_iter)
 
-        lr = get_lr(it, cfg, lr_decay_iters)
+        lr = lr_scheduler.step(it)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
@@ -437,6 +426,9 @@ def main():
         if it > 0 and it % cfg.eval_interval == 0:
             val_loss, r2, pear = evaluate(model, val_loader, cfg, gene_mean)
             print(f"iter {it:6d} | epoch {epoch:.2f} | val loss {val_loss:.4f} | R²(vs mean) {r2:+.3f} | pearson_r {pear:+.3f}")
+            reduced = lr_scheduler.on_eval(val_loss)
+            if reduced:
+                print(f"  val loss plateaued -> reducing LR to {lr_scheduler._lr:.2e} at iter {it}")
             if val_loss < best_val:
                 best_val = val_loss
                 ckpt = {
@@ -446,7 +438,7 @@ def main():
                     "gene_ids": list(adata.var_names),
                     "iter": it,
                     "val_loss": val_loss,
-                    "lr_decay_iters": lr_decay_iters,
+                    "lr_schedule_state": lr_scheduler.state_dict(),
                 }
                 torch.save(ckpt, out_dir / "ckpt.pt")
                 print(f"  saved checkpoint (val {val_loss:.4f})")
