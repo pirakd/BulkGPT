@@ -110,8 +110,13 @@ class ReduceLROnPlateauLR:
 
         self._plateau_count += 1
         if self._plateau_count >= self.cfg.patience:
-            self._lr = max(self.cfg.min_lr, self._lr * self.cfg.factor)
+            new_lr = max(self.cfg.min_lr, self._lr * self.cfg.factor)
             self._plateau_count = 0
+            # Already at the floor: no actual reduction, so don't report one
+            # (avoids a misleading "plateaued -> reducing LR" log forever).
+            if new_lr >= self._lr:
+                return False
+            self._lr = new_lr
             self._cooldown_count = self.cfg.cooldown
             return True
         return False
