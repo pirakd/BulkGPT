@@ -58,7 +58,7 @@ lr_schedule:
   min_lr: 3.0e-5     # floor LR that reductions never go below
   warmup_iters: 1000 # linear warmup at the very start of training only
   factor: 0.5        # multiply LR by this whenever a plateau is detected
-  patience: 5        # evals with no val-loss improvement before reducing LR
+  patience: 3        # evals with no val-loss improvement before reducing LR
   min_delta: 0.0     # minimum val-loss decrease that counts as "improvement"
   cooldown: 2        # evals to wait after a reduction before another can trigger
 
