@@ -1,0 +1,79 @@
+# Default configuration for train_nano_bulk_fm.py
+#
+# This is the single source of truth for all run parameters. It is loaded
+# first to build the run configuration; any --flag passed on the CLI
+# overrides the corresponding value here. The fully resolved configuration
+# (this file's values + CLI overrides) is written next to each run's
+# checkpoint as `config.yaml` so every checkpoint is reproducible.
+
+# --- data ---
+data_source: hf            # "local" or "hf"
+data_path: data/archs4/preprocessed_full.h5ad
+hf_repo_id: dpirak/nanobulkFM
+hf_filename: preprocessed_full.h5ad
+hf_revision: null
+hf_cache_dir: null
+
+# --- ESM gene embeddings ---
+use_esm_embeddings: true
+esm_data_source: hf        # "local" or "hf"
+esm_embeddings_path: data/genes/build_gene_protein_embeddings/20260609_114706/protein_coding_gene_esm2_embeddings.parquet
+esm_hf_repo_id: dpirak/nanobulkFM
+esm_hf_filename: protein_coding_gene_esm2_embeddings.parquet
+esm_hf_revision: null
+esm_hf_cache_dir: null
+
+# --- model ---
+n_layer: 6
+n_head: 8
+n_embd: 256
+dropout: 0.1
+bias: true
+
+# --- training loop ---
+mask_ratio: 0.30
+batch_size: 64
+val_frac: 0.05
+max_iters: 250000000
+eval_interval: 2000
+eval_iters: 50
+log_interval: 50
+
+# --- optimizer ---
+weight_decay: 0.01
+betas: [0.9, 0.95]
+grad_clip: 1.0
+
+# --- LR schedule ---
+# Linear warmup followed by a flat LR that only ever decreases, triggered by
+# a validation-loss plateau (mirrors torch's ReduceLROnPlateau). See
+# lr_schedule.py for full details. No warm restarts / LR spikes -- those were
+# too compute-heavy for the benefit they gave, since each restart forces the
+# model to re-explore and re-converge from a much higher LR. This schedule's
+# shape does NOT depend on `max_iters`: it only depends on these values plus
+# the state saved in the checkpoint, so bumping max_iters or resuming any
+# number of times never reshapes it unexpectedly.
+lr_schedule:
+  base_lr: 5.0e-3   # initial (peak) LR, held flat after warmup until a plateau reduces it
+  min_lr: 3.0e-5     # floor LR that reductions never go below
+  warmup_iters: 1000 # linear warmup at the very start of training only
+  factor: 0.5        # multiply LR by this whenever a plateau is detected
+  patience: 5        # evals with no val-loss improvement before reducing LR
+  min_delta: 0.0     # minimum val-loss decrease that counts as "improvement"
+  cooldown: 2        # evals to wait after a reduction before another can trigger
+
+# --- misc ---
+n_samples_subset: null
+seed: 42
+device: null                  # null = auto-detect (mps > cuda > cpu)
+
+# --- resume ---
+# Continue training from an existing run's output folder (containing
+# ckpt.pt and config.yaml). Can also be set via --resume / --resume-dir on
+# the CLI, which take precedence over these values. Setting resume: true
+# here requires resume_dir to also be set.
+# NOTE: left disabled -- the current model config (n_layer/n_embd/n_head)
+# was scaled up from prior runs, so old checkpoints are architecturally
+# incompatible and this must start fresh.
+resume: false
+resume_dir: null
